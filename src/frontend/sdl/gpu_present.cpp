@@ -363,7 +363,7 @@ bool GpuPresent::present(ScanoutOut& out, const u32* const fb[2], const View* vi
       for (int axis = 0; axis < 2; ++axis) {
         const u32 n = static_cast<u32>(std::max(0, dim[axis])), sn = static_cast<u32>(srcn[axis]);
         if (n == 0 || n > 1024) continue;
-        const u32 min_run = std::max<u32>(2, (n + sn - 1) / sn), pitch = n == 2 * sn ? 2 : 1;
+        const u32 min_run = std::max<u32>(2, (n + sn - 1) / sn), pitch = grid == 0 && n == 2 * sn ? 2 : 1;
         for (u32 s = 0; s < sn; ++s) {
           const u32 x0 = (s * n + sn - 1) / sn, x1 = ((s + 1) * n + sn - 1) / sn;
           if (x1 - x0 >= min_run && s % pitch == 0 && x0 < n) t[v * 64 + axis * 32 + (x0 >> 5)] |= 1u << (x0 & 31);

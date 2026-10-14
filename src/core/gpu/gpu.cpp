@@ -1149,10 +1149,12 @@ void Gpu::emit_scaled(int screen, u32 line, const u32* src) {
   // dimmed, so each DS pixel shows a lit cell with a dark seam right/below.
   // A run of one pixel is left alone. Only runs the fractional scale widened
   // carry a seam (min_run = ceil(scale)); the seam leads its run. At exactly
-  // 2x a seam per pixel reads as a wash, so it goes on every other pixel instead (4-pixel pitch).
+  // 2x a full-strength seam per pixel reads as a wash, so a black seam goes on every other pixel instead
+  // (4-pixel pitch); a dimmed one stays on every pixel.
   const u32 w = t.xrun[SCREEN_W];
   const u32 min_run = (w + SCREEN_W - 1) / SCREEN_W, min_rows = (t.h + SCREEN_H - 1) / SCREEN_H;
-  const u32 pitch_x = w == 2 * SCREEN_W ? 2 : 1, pitch_y = t.h == 2 * SCREEN_H ? 2 : 1;
+  const bool black = t.grid == 0;
+  const u32 pitch_x = black && w == 2 * SCREEN_W ? 2 : 1, pitch_y = black && t.h == 2 * SCREEN_H ? 2 : 1;
   const bool seam = y1 - y0 >= std::max<u32>(2, min_rows) && first % pitch_y == 0;
   const u32 yfirst = seam ? y0 + 1 : y0;
   row = stage ? row_scratch_[screen] : row_at(t, yfirst);
