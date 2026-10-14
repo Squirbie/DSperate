@@ -313,6 +313,9 @@ private:
 public:
   void start_rtc_clock();   // host time; also clears power-lost; survives reset()
   bool rtc_host_clock() const { return rtc_host_clock_; }
+  // Re-read the host clock into a running RTC (after the host slept, which
+  // emulated time does not see). No-op unless start_rtc_clock() was called.
+  void resync_rtc_clock() { if (rtc_host_clock_) rtc_seed(); }
   void rtc_event();
   static void grid_rtc_event(NDS& nds, u32);   // DSi interleave grid
 private:

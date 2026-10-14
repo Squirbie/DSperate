@@ -3384,7 +3384,12 @@ sdl_ready:
       ds::input::apply(nds, in);
     } else {
       bool closed;
-      if (lid.poll(closed)) { input.set_lid(closed); if (closed) flush_save(); }
+      if (lid.poll(closed)) {
+        // The guest wakes to the host's time: emulated time stood still while the host slept.
+        if (!closed) nds.io.resync_rtc_clock();
+        input.set_lid(closed);
+        if (closed) flush_save();
+      }
       in.lid = input.lid();
       if (input.fake_mic()) input.fake_mic_frame(mic);
       else {
