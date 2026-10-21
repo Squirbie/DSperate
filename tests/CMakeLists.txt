@@ -161,4 +161,6 @@ endif()
 # RGA probe (gpu-raster branch): times the Rockchip 2D scaler (V4L2 mem2mem) on a dma-buf frame. Device-only, not a test.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   add_executable(rga_probe rga_probe.cpp)
+  # Integer nearest scaling from 1:1 RGA jobs (stride and rotation tricks); --sim checks the geometry anywhere.
+  add_executable(rga_nearest_probe rga_nearest_probe.cpp)
 endif()
