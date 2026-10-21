@@ -29,8 +29,10 @@
 // The CPU hybrids: "-cpu-rows" has the CPU repeat columns (a 256k x 192
 // strip) and the RGA repeat rows with unrotated jobs, no rotation at all;
 // "-cpu2-rot" has the CPU do 2x both ways and the RGA the rest by rotation.
-// Their CPU pass includes the cache flush; "baseline" is the 192 KB copy
+// "-cpu-rows" times its CPU side as the two dma-buf syncs and the writes
+// (NEON interleaving stores, memcpy at 1x); "baseline" is the 192 KB copy
 // the presenter's CPU already makes per screen.
+//   DS_RGA_STRIP_HEAP=name   the "-cpu-rows" strip from that dma-heap (listed at start)
 //
 // Every integer case compares each panel pixel with centre-sampled nearest
 // (and the letterbox with its untouched fill). Device-only, not a test;
@@ -55,6 +57,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <dirent.h>
 #include <fcntl.h>
 #include <linux/dma-buf.h>
 #include <linux/videodev2.h>
@@ -86,10 +89,14 @@ struct Fmt { uint32_t w, h; };   // XBGR32, stride w*4 (the driver aligns stride
 // A dma-buf (or, under --sim, plain memory) of XRGB pixels.
 struct Buf {
   int fd = -1; uint32_t* px = nullptr; size_t len = 0;
-  bool alloc(size_t bytes) {
+  // `heap`: a /dev/dma_heap name or path to use instead of the defaults.
+  bool alloc(size_t bytes, const char* heap_override = nullptr) {
     len = bytes;
     if (g_sim) { px = static_cast<uint32_t*>(std::calloc(bytes, 1)); return px != nullptr; }
-    for (const char* heap : {"/dev/dma_heap/linux,cma", "/dev/dma_heap/system"}) {
+    const std::string forced = !heap_override ? "" : heap_override[0] == '/' ? heap_override : std::string("/dev/dma_heap/") + heap_override;
+    const char* defaults[] = {"/dev/dma_heap/linux,cma", "/dev/dma_heap/system"};
+    const char* only[] = {forced.c_str()};
+    for (const char* heap : forced.empty() ? std::vector<const char*>(defaults, defaults + 2) : std::vector<const char*>(only, only + 1)) {
       const int h = open(heap, O_RDWR | O_CLOEXEC);
       if (h < 0) continue;
       dma_heap_allocation_data a{}; a.len = bytes; a.fd_flags = O_RDWR | O_CLOEXEC;
@@ -97,7 +104,7 @@ struct Buf {
       close(h);
       if (r == 0) { fd = static_cast<int>(a.fd); break; }
     }
-    if (fd < 0) { std::printf("no dma-buf of %zu bytes\n", bytes); return false; }
+    if (fd < 0) { std::printf("no dma-buf of %zu bytes%s%s\n", bytes, forced.empty() ? "" : " from ", forced.c_str()); return false; }
     void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (p == MAP_FAILED) { std::perror("mmap"); return false; }
     px = static_cast<uint32_t*>(p);
@@ -297,25 +304,38 @@ struct IntScalerFlat {
   }
 };
 
-// CPU pixel repeats for the hybrids (NEON for 2x and 4x, as the
-// frontend's nearest_scale.cpp). Row-major, stride = width.
-void repeat_row(const uint32_t* s, uint32_t* d, uint32_t k) {
-  uint32_t x = 0;
+// CPU pixel repeats for the hybrids: each of `n` source pixels k times in
+// a row. With no row padding a whole frame is one call. NEON: one
+// interleaving store of k copies of the same vector writes 4 pixels k times
+// each (vst2q/vst3q/vst4q); two of them per loop for 8 pixels.
+void repeat_px(const uint32_t* s, uint32_t* d, uint32_t k, size_t n) {
+  if (k == 1) { std::memcpy(d, s, n * 4); return; }
+  size_t x = 0;
 #if defined(__ARM_NEON)
   if (k == 2)
-    for (; x < SW; x += 4) { const uint32x4_t v = vld1q_u32(s + x); const uint32x4x2_t z = vzipq_u32(v, v); vst1q_u32(d + 2 * x, z.val[0]); vst1q_u32(d + 2 * x + 4, z.val[1]); }
+    for (; x + 8 <= n; x += 8) {
+      const uint32x4_t a = vld1q_u32(s + x), b = vld1q_u32(s + x + 4);
+      vst2q_u32(d + 2 * x, (uint32x4x2_t{{a, a}})); vst2q_u32(d + 2 * x + 8, (uint32x4x2_t{{b, b}}));
+    }
+  else if (k == 3)
+    for (; x + 8 <= n; x += 8) {
+      const uint32x4_t a = vld1q_u32(s + x), b = vld1q_u32(s + x + 4);
+      vst3q_u32(d + 3 * x, (uint32x4x3_t{{a, a, a}})); vst3q_u32(d + 3 * x + 12, (uint32x4x3_t{{b, b, b}}));
+    }
   else if (k == 4)
-    for (; x < SW; x += 4) {
-      const uint32x4_t v = vld1q_u32(s + x);
-      vst1q_u32(d + 4 * x, vdupq_n_u32(vgetq_lane_u32(v, 0))); vst1q_u32(d + 4 * x + 4, vdupq_n_u32(vgetq_lane_u32(v, 1)));
-      vst1q_u32(d + 4 * x + 8, vdupq_n_u32(vgetq_lane_u32(v, 2))); vst1q_u32(d + 4 * x + 12, vdupq_n_u32(vgetq_lane_u32(v, 3)));
+    for (; x + 8 <= n; x += 8) {
+      const uint32x4_t a = vld1q_u32(s + x), b = vld1q_u32(s + x + 4);
+      vst4q_u32(d + 4 * x, (uint32x4x4_t{{a, a, a, a}})); vst4q_u32(d + 4 * x + 16, (uint32x4x4_t{{b, b, b, b}}));
     }
 #endif
-  for (; x < SW; ++x) for (uint32_t i = 0; i < k; ++i) d[x * k + i] = s[x];
+  for (; x < n; ++x) for (uint32_t i = 0; i < k; ++i) d[x * k + i] = s[x];
 }
 
 // CPU repeats columns (256k x 192, rows not repeated); the RGA repeats rows
 // with k unrotated 1:1 jobs into the panel described as k*W x H/k. No rotation.
+// The CPU side is timed in three: the begin-access sync, the writes, and
+// the end-access sync (the cache clean of the strip). DS_RGA_STRIP_HEAP
+// puts the strip in another dma-heap (an uncached one needs no clean).
 struct IntScalerCpuRows {
   uint32_t k = 1, tw = 0, th = 0;
   Rga c;
@@ -323,25 +343,28 @@ struct IntScalerCpuRows {
   bool open(const char* dev, uint32_t k_, uint32_t tw_, uint32_t th_) {
     k = k_; tw = tw_; th = th_;
     if (k * tw > 8192 || SW * k > 8192 || th / k < 34) { std::printf("k=%u on %ux%u exceeds the driver's 8192 / 34 limits\n", k, tw, th); return false; }
-    return h.alloc(static_cast<size_t>(SW) * k * SH * 4) && c.open(dev, Fmt{SW * k, SH}, Fmt{k * tw, th / k}, 0);
+    return h.alloc(static_cast<size_t>(SW) * k * SH * 4, std::getenv("DS_RGA_STRIP_HEAP")) && c.open(dev, Fmt{SW * k, SH}, Fmt{k * tw, th / k}, 0);
   }
-  static constexpr int kPasses = 2;
-  static constexpr const char* kPassNames[kPasses] = {"CPU columns xk (256k x 192)", "RGA unrotated, k jobs (panel)"};
-  double pass_mib(int j) const { return static_cast<double>(SW) * k * SH * 4 * (j == 0 ? 1 : k) / 1048576.0; }
+  static constexpr int kPasses = 4;
+  static constexpr const char* kPassNames[kPasses] = {"CPU sync start", "CPU columns xk (256k x 192)", "CPU sync end (cache clean)", "RGA unrotated, k jobs (panel)"};
+  double pass_mib(int j) const { return j == 0 || j == 2 ? 0.0 : static_cast<double>(SW) * k * SH * 4 * (j == 1 ? 1 : k) / 1048576.0; }
   int jobs() const { return static_cast<int>(k); }
   void diagnose(const Buf&) const {}
   bool run(const Buf& src, const Buf& target, int x0, int y0, double* pass_ms = nullptr) {
     double t0 = now_ms();
+    auto lap = [&](int i) { if (pass_ms) { const double t1 = now_ms(); pass_ms[i] = t1 - t0; t0 = t1; } };
     h.cpu(true, true);
-    for (uint32_t y = 0; y < SH; ++y) repeat_row(src.px + static_cast<size_t>(y) * SW, h.px + static_cast<size_t>(y) * SW * k, k);
+    lap(0);
+    repeat_px(src.px, h.px, k, static_cast<size_t>(SW) * SH);
+    lap(1);
     h.cpu(false, true);
-    if (pass_ms) { const double t1 = now_ms(); pass_ms[0] = t1 - t0; t0 = t1; }
+    lap(2);
     for (uint32_t j = 0; j < k; ++j) {
       const uint32_t t = static_cast<uint32_t>(y0) + j;
       const Rect r{static_cast<int>((t % k) * tw) + x0, static_cast<int>(t / k), static_cast<int>(SW * k), static_cast<int>(SH)};
       if (!c.blit(h, target, r)) return false;
     }
-    if (pass_ms) pass_ms[1] = now_ms() - t0;
+    lap(3);
     return true;
   }
 };
@@ -367,7 +390,7 @@ struct IntScalerCpu2Rot {
     p.cpu(true, true);
     for (uint32_t y = 0; y < SH; ++y) {
       uint32_t* row = p.px + static_cast<size_t>(y) * 2 * SW * 2;
-      repeat_row(src.px + static_cast<size_t>(y) * SW, row, 2);
+      repeat_px(src.px + static_cast<size_t>(y) * SW, row, 2, SW);
       std::memcpy(row + SW * 2, row, SW * 2 * 4);
     }
     p.cpu(false, true);
@@ -436,6 +459,7 @@ void report_pass(const char* what, std::vector<double>& ms, double mib) {
   if (ms.empty()) return;
   std::sort(ms.begin(), ms.end());
   const double med = ms[ms.size() / 2];
+  if (mib <= 0) { std::printf("    %-32s median %.3f ms\n", what, med); return; }
   std::printf("    %-32s median %.3f ms, writes %.2f MiB (%.0f MiB/s)\n", what, med, mib, med > 0 ? mib * 1000.0 / med : 0.0);
 }
 
@@ -515,6 +539,11 @@ int main(int argc, char** argv) {
   if (!g_sim && dev.empty()) dev = find_rga();
   if (!g_sim && dev.empty()) { std::printf("no rockchip-rga V4L2 device (pass /dev/videoN, or --sim)\n"); return 1; }
   std::printf("%s\n", g_sim ? "software model (--sim): checks the job geometry, not the hardware" : dev.c_str());
+  if (!g_sim) {
+    std::printf("dma-heaps:");
+    if (DIR* d = opendir("/dev/dma_heap")) { while (const dirent* e = readdir(d)) if (e->d_name[0] != '.') std::printf(" %s", e->d_name); closedir(d); }
+    std::printf("%s%s\n", std::getenv("DS_RGA_STRIP_HEAP") ? " (strip from " : "", std::getenv("DS_RGA_STRIP_HEAP") ? std::string(std::getenv("DS_RGA_STRIP_HEAP")).append(")").c_str() : "");
+  }
 
   uint32_t pw = 1024, ph = 768;
   if (const char* s = std::getenv("DS_RGA_DW")) std::sscanf(s, "%ux%u", &pw, &ph);
