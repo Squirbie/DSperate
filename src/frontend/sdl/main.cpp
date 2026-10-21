@@ -2475,7 +2475,7 @@ sdl_ready:
         if (net_live && *net_live) return "NOT DURING A NETWORK SESSION";
         return cfg.num("emu.frameskip", 0) > 0 ? "" : "ONLY WITH FRAMESKIP ON";
       case ds::sdl::Dep::PanelEffects:
-        if (display.rga_present()) return "THE RGA ALWAYS SCALES BILINEAR";
+        if (display.rga_present()) return "";   // off: exact at whole-number scales, bilinear between
         return panel_effects() ? "" : "THIS SCREEN SCALES IN HARDWARE";
       case ds::sdl::Dep::GridSeam:
         if (display.rga_present()) return std::strcmp(s.key, "video.seam") == 0 ? "THE RGA DRAWS THE DARK GRID ONLY" : "";
