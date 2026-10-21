@@ -30,6 +30,17 @@ void main() {
   // The DS floors its positions and lights the pixel a vertex lands in; a
   // quarter-pixel pull back towards that measured closest to its edges.
   float sxf = float(vt.fx) / 16.0 - 0.25, syf = float(vt.fy) / 16.0 - 0.25;
+  // Each polygon grows 1/16 px outward from its centre: a T-junction vertex
+  // sits on its neighbour's edge only to the 28.4 grid, and the hairline
+  // left over showed whatever lay behind (bright terrain under a black
+  // horizon wall) as specks. The DS's inclusive spans never leave one.
+  {
+    vec2 c = vec2(0.0);
+    for (uint j = 0u; j < p.nverts; ++j) c += vec2(float(verts[p.first_vert + j].fx), float(verts[p.first_vert + j].fy));
+    vec2 dv = vec2(float(vt.fx), float(vt.fy)) - c / float(p.nverts);
+    float len = length(dv);
+    if (len > 0.0) { sxf += dv.x / len * 0.0625; syf += dv.y / len * 0.0625; }
+  }
   float ox = 0.0, oy = 0.0;
   // A zero-width/height polygon is a line to the DS but zero area here:
   // give it one pixel via the second/third vertex.
