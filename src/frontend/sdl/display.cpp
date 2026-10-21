@@ -341,11 +341,13 @@ void Display::layout() {
 bool Display::try_gpu_present() {
   if (!gpu_wanted_ || !out_) return false;
   std::string why;
-  if (gpu_mode_ != GpuPresentMode::Vulkan) gpu_ = open_rga_presenter(*out_, &why);
-  if (!gpu_ && gpu_mode_ != GpuPresentMode::Rga) {
+  // Auto: Vulkan first (a render pass into the scanout buffer beats the
+  // RGA's ~1.1 GB/s, even beside the GPU 3D layer), the RGA where it fails.
+  if (gpu_mode_ != GpuPresentMode::Rga) gpu_ = open_vk_import_presenter(*out_, &why);
+  if (!gpu_ && gpu_mode_ != GpuPresentMode::Vulkan) {
     std::string why2;
-    gpu_ = open_vk_import_presenter(*out_, &why2);
-    if (!gpu_) why = gpu_mode_ == GpuPresentMode::Vulkan ? why2 : why + "; " + why2;
+    gpu_ = open_rga_presenter(*out_, &why2);
+    if (!gpu_) why = gpu_mode_ == GpuPresentMode::Rga ? why2 : why + "; " + why2;
   }
   if (!gpu_) { std::fprintf(stderr, "video.gpu_present: %s; scanline scaling instead\n", why.c_str()); return false; }
   scaled_ = false;

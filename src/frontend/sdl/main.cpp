@@ -167,8 +167,8 @@ const char* kUsage =
     "                  surface (SDL's window surface) | renderer (SDL_Renderer). One that won't open\n"
     "                  falls back to the renderer. video.sink. --disp / --fbdev are --sink disp / fbdev\n"
     "  --gpu-present / --no-gpu-present  scale and lay out the picture off the CPU, into the\n"
-    "                  scanout buffer: the Rockchip RGA where the device has one, else a Vulkan\n"
-    "                  compute pass (video.gpu_present = true | rga | vulkan | false; on by default)\n"
+    "                  scanout buffer: a Vulkan render pass, else the Rockchip RGA where the\n"
+    "                  device has one (video.gpu_present = true | rga | vulkan | false; on by default)\n"
     "  --preload-rom / --no-preload-rom  read the whole ROM into memory at load, or page it in as\n"
     "                  the game reads it (cart.preload = auto | true | false; auto preloads a ROM on a\n"
     "                  network share that fits in memory, where a page read mid-frame is a round trip)\n"
@@ -800,7 +800,7 @@ struct VideoSetup {
   ds::sdl::Display::Layout layout;
   std::vector<ds::sdl::Display::Mode> layout_cycle;
   bool   gpu_present = false;
-  ds::sdl::Display::GpuPresentMode gpu_mode = ds::sdl::Display::GpuPresentMode::Auto;   // video.gpu_present: true (auto: RGA, else Vulkan) | rga | vulkan
+  ds::sdl::Display::GpuPresentMode gpu_mode = ds::sdl::Display::GpuPresentMode::Auto;   // video.gpu_present: true (auto: Vulkan, else RGA) | rga | vulkan
   // Boot-only, see above.
   ds::frontend::Sink panel_sink = ds::frontend::Sink::Count;   // Disp/Fbdev when one owns the panel (frontend/video/select.h)
   ds::frontend::Sink want_sink = ds::frontend::Sink::Count;    // explicit video.sink among the window sinks

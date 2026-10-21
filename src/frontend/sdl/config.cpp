@@ -286,9 +286,9 @@ R"(# DSperate settings. Command-line flags override this file. Two files next
                                 # (one that won't open falls back to the renderer). The older disp = and
                                 # fbdev = keys are still read, and say so
 # gpu_present = true            # true | false | rga | vulkan. true: the panel is scaled and composed off
-                                # the CPU by the RGA (the Rockchip 2D accelerator, through V4L2: leaves the
-                                # GPU to the 3D layer) where the device has one, else by Vulkan (a compute
-                                # dispatch into the scanout dma-buf). rga / vulkan: that one only. Declines
+                                # the CPU by Vulkan (a render pass on the scanout dma-buf), else by the RGA
+                                # (the Rockchip 2D accelerator, through V4L2) where the device has one.
+                                # rga / vulkan: that one only. Declines
                                 # cleanly to the CPU scanline scaler where neither works (no dma-buf
                                 # scanout, no Vulkan, no RGA).
 # vsync = true
