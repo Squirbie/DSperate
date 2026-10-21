@@ -26,6 +26,12 @@
 // image rotated and the panel-sized writes unrotated, timed per pass, to
 // show whether rotated writes are what costs.
 //
+// The CPU hybrids: "-cpu-rows" has the CPU repeat columns (a 256k x 192
+// strip) and the RGA repeat rows with unrotated jobs, no rotation at all;
+// "-cpu2-rot" has the CPU do 2x both ways and the RGA the rest by rotation.
+// Their CPU pass includes the cache flush; "baseline" is the 192 KB copy
+// the presenter's CPU already makes per screen.
+//
 // Every integer case compares each panel pixel with centre-sampled nearest
 // (and the letterbox with its untouched fill). Device-only, not a test;
 // --sim runs the same jobs through a software model of the RGA, which
@@ -56,6 +62,9 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
 
 #if defined(V4L2_PIX_FMT_XBGR32) && defined(V4L2_CAP_VIDEO_M2M_MPLANE)
 
@@ -207,33 +216,38 @@ private:
   Fmt in_{}, out_{};
 };
 
-// The integer scaler: two contexts and the 192 x 256k intermediate, for a
+void diagnose_pass_a(const Buf& src, const Buf& i1, uint32_t k);
+
+// The integer scaler: two contexts and the sh x sw*k intermediate, for a
 // target buffer `tw` x `th` (stride tw*4). Views at any x0, y0 that fit.
+// The source is the 256x192 frame, or the CPU-2x variant's 512x384.
 struct IntScaler {
-  uint32_t k = 1, tw = 0, th = 0;
+  uint32_t k = 1, tw = 0, th = 0, sw = SW, sh = SH;
   Rga a, b;
   Buf i1;
-  bool open(const char* dev, uint32_t k_, uint32_t tw_, uint32_t th_) {
-    k = k_; tw = tw_; th = th_;
+  bool open(const char* dev, uint32_t k_, uint32_t tw_, uint32_t th_, uint32_t sw_ = SW, uint32_t sh_ = SH) {
+    k = k_; tw = tw_; th = th_; sw = sw_; sh = sh_;
     // Driver limits: widths/heights 34..8192, scale factor checks against the default rectangles.
-    if (k * tw > 8192 || SW * k > 8192 || th / k < 34) { std::printf("k=%u on %ux%u exceeds the driver's 8192 / 34 limits\n", k, tw, th); return false; }
-    if (!i1.alloc(static_cast<size_t>(SH) * SW * k * 4)) return false;
-    return a.open(dev, Fmt{SW, SH}, Fmt{SH * k, SW}, 90) && b.open(dev, Fmt{SH, SW * k}, Fmt{k * tw, th / k}, 270);
+    if (k * tw > 8192 || sw * k > 8192 || th / k < 34) { std::printf("k=%u on %ux%u exceeds the driver's 8192 / 34 limits\n", k, tw, th); return false; }
+    if (!i1.alloc(static_cast<size_t>(sh) * sw * k * 4)) return false;
+    return a.open(dev, Fmt{sw, sh}, Fmt{sh * k, sw}, 90) && b.open(dev, Fmt{sh, sw * k}, Fmt{k * tw, th / k}, 270);
   }
   static constexpr int kPasses = 2;
   static constexpr const char* kPassNames[kPasses] = {"A rot90, k jobs (192 x 256k)", "B rot270, k jobs (panel)"};
+  double pass_mib(int j) const { return static_cast<double>(sw) * k * sh * 4 * (j == 0 ? 1 : k) / 1048576.0; }
   int jobs() const { return static_cast<int>(2 * k); }
+  void diagnose(const Buf& src) const { if (sw == SW) diagnose_pass_a(src, i1, k); }
   // pass_ms, if given: the time of each pass.
   bool run(const Buf& src, const Buf& target, int x0, int y0, double* pass_ms = nullptr) {
     double t0 = now_ms();
-    // Pass A: band j of the virtual 192k x 256 image is physical rows k*r + j.
+    // Pass A: band j of the virtual sh*k x sw image is physical rows k*r + j.
     for (uint32_t j = 0; j < k; ++j)
-      if (!a.blit(src, i1, Rect{static_cast<int>(SH * j), 0, static_cast<int>(SH), static_cast<int>(SW)})) return false;
+      if (!a.blit(src, i1, Rect{static_cast<int>(sh * j), 0, static_cast<int>(sh), static_cast<int>(sw)})) return false;
     if (pass_ms) { const double t1 = now_ms(); pass_ms[0] = t1 - t0; t0 = t1; }
     // Pass B: physical row y0 + k*s + j is virtual row (y0 + j)/k + s, band (y0 + j) % k.
     for (uint32_t j = 0; j < k; ++j) {
       const uint32_t t = static_cast<uint32_t>(y0) + j;
-      const Rect r{static_cast<int>((t % k) * tw) + x0, static_cast<int>(t / k), static_cast<int>(SW * k), static_cast<int>(SH)};
+      const Rect r{static_cast<int>((t % k) * tw) + x0, static_cast<int>(t / k), static_cast<int>(sw * k), static_cast<int>(sh)};
       if (!b.blit(i1, target, r)) return false;
     }
     if (pass_ms) pass_ms[1] = now_ms() - t0;
@@ -263,7 +277,9 @@ struct IntScalerFlat {
   }
   static constexpr int kPasses = 3;
   static constexpr const char* kPassNames[kPasses] = {"A rot90, k jobs (192 x 256k)", "B rot270, 1 job (256k x 192)", "C unrotated, k jobs (panel)"};
+  double pass_mib(int j) const { return static_cast<double>(SW) * k * SH * 4 * (j == 2 ? k : 1) / 1048576.0; }
   int jobs() const { return static_cast<int>(2 * k + 1); }
+  void diagnose(const Buf& src) const { diagnose_pass_a(src, i1, k); }
   bool run(const Buf& src, const Buf& target, int x0, int y0, double* pass_ms = nullptr) {
     double t0 = now_ms();
     for (uint32_t j = 0; j < k; ++j)
@@ -278,6 +294,85 @@ struct IntScalerFlat {
     }
     if (pass_ms) pass_ms[2] = now_ms() - t0;
     return true;
+  }
+};
+
+// CPU pixel repeats for the hybrids (NEON for 2x and 4x, as the
+// frontend's nearest_scale.cpp). Row-major, stride = width.
+void repeat_row(const uint32_t* s, uint32_t* d, uint32_t k) {
+  uint32_t x = 0;
+#if defined(__ARM_NEON)
+  if (k == 2)
+    for (; x < SW; x += 4) { const uint32x4_t v = vld1q_u32(s + x); const uint32x4x2_t z = vzipq_u32(v, v); vst1q_u32(d + 2 * x, z.val[0]); vst1q_u32(d + 2 * x + 4, z.val[1]); }
+  else if (k == 4)
+    for (; x < SW; x += 4) {
+      const uint32x4_t v = vld1q_u32(s + x);
+      vst1q_u32(d + 4 * x, vdupq_n_u32(vgetq_lane_u32(v, 0))); vst1q_u32(d + 4 * x + 4, vdupq_n_u32(vgetq_lane_u32(v, 1)));
+      vst1q_u32(d + 4 * x + 8, vdupq_n_u32(vgetq_lane_u32(v, 2))); vst1q_u32(d + 4 * x + 12, vdupq_n_u32(vgetq_lane_u32(v, 3)));
+    }
+#endif
+  for (; x < SW; ++x) for (uint32_t i = 0; i < k; ++i) d[x * k + i] = s[x];
+}
+
+// CPU repeats columns (256k x 192, rows not repeated); the RGA repeats rows
+// with k unrotated 1:1 jobs into the panel described as k*W x H/k. No rotation.
+struct IntScalerCpuRows {
+  uint32_t k = 1, tw = 0, th = 0;
+  Rga c;
+  Buf h;
+  bool open(const char* dev, uint32_t k_, uint32_t tw_, uint32_t th_) {
+    k = k_; tw = tw_; th = th_;
+    if (k * tw > 8192 || SW * k > 8192 || th / k < 34) { std::printf("k=%u on %ux%u exceeds the driver's 8192 / 34 limits\n", k, tw, th); return false; }
+    return h.alloc(static_cast<size_t>(SW) * k * SH * 4) && c.open(dev, Fmt{SW * k, SH}, Fmt{k * tw, th / k}, 0);
+  }
+  static constexpr int kPasses = 2;
+  static constexpr const char* kPassNames[kPasses] = {"CPU columns xk (256k x 192)", "RGA unrotated, k jobs (panel)"};
+  double pass_mib(int j) const { return static_cast<double>(SW) * k * SH * 4 * (j == 0 ? 1 : k) / 1048576.0; }
+  int jobs() const { return static_cast<int>(k); }
+  void diagnose(const Buf&) const {}
+  bool run(const Buf& src, const Buf& target, int x0, int y0, double* pass_ms = nullptr) {
+    double t0 = now_ms();
+    h.cpu(true, true);
+    for (uint32_t y = 0; y < SH; ++y) repeat_row(src.px + static_cast<size_t>(y) * SW, h.px + static_cast<size_t>(y) * SW * k, k);
+    h.cpu(false, true);
+    if (pass_ms) { const double t1 = now_ms(); pass_ms[0] = t1 - t0; t0 = t1; }
+    for (uint32_t j = 0; j < k; ++j) {
+      const uint32_t t = static_cast<uint32_t>(y0) + j;
+      const Rect r{static_cast<int>((t % k) * tw) + x0, static_cast<int>(t / k), static_cast<int>(SW * k), static_cast<int>(SH)};
+      if (!c.blit(h, target, r)) return false;
+    }
+    if (pass_ms) pass_ms[1] = now_ms() - t0;
+    return true;
+  }
+};
+
+// CPU 2x both ways (512x384); the RGA does the remaining k/2 with the
+// rotation trick on that larger image. Even k only.
+struct IntScalerCpu2Rot {
+  uint32_t k = 2;
+  IntScaler rga;
+  Buf p;
+  bool open(const char* dev, uint32_t k_, uint32_t tw, uint32_t th) {
+    k = k_;
+    if (k % 2) { std::printf("needs an even scale\n"); return false; }
+    return p.alloc(static_cast<size_t>(SW) * 2 * SH * 2 * 4) && rga.open(dev, k / 2, tw, th, SW * 2, SH * 2);
+  }
+  static constexpr int kPasses = 3;
+  static constexpr const char* kPassNames[kPasses] = {"CPU 2x2 (512x384)", "A rot90, k/2 jobs (384 x 512k/2)", "B rot270, k/2 jobs (panel)"};
+  double pass_mib(int j) const { return j == 0 ? SW * 2.0 * SH * 2 * 4 / 1048576.0 : rga.pass_mib(j - 1); }
+  int jobs() const { return rga.jobs(); }
+  void diagnose(const Buf&) const {}
+  bool run(const Buf& src, const Buf& target, int x0, int y0, double* pass_ms = nullptr) {
+    const double t0 = now_ms();
+    p.cpu(true, true);
+    for (uint32_t y = 0; y < SH; ++y) {
+      uint32_t* row = p.px + static_cast<size_t>(y) * 2 * SW * 2;
+      repeat_row(src.px + static_cast<size_t>(y) * SW, row, 2);
+      std::memcpy(row + SW * 2, row, SW * 2 * 4);
+    }
+    p.cpu(false, true);
+    if (pass_ms) pass_ms[0] = now_ms() - t0;
+    return rga.run(p, target, x0, y0, pass_ms ? pass_ms + 1 : nullptr);
   }
 };
 
@@ -305,16 +400,15 @@ size_t check(const Buf& src, const Buf& t, uint32_t tw, uint32_t th, uint32_t k,
 }
 
 // After a failure: is I1 an exact rotated, row-repeated copy, and which way?
-template <class S>
-void diagnose_pass_a(const Buf& src, const S& s) {
+void diagnose_pass_a(const Buf& src, const Buf& i1, uint32_t k) {
   size_t cw = 0, ccw = 0;
-  src.cpu(true, false); s.i1.cpu(true, false);
-  for (uint32_t r = 0; r < SW * s.k; ++r) for (uint32_t c = 0; c < SH; ++c) {
-    const uint32_t got = s.i1.px[static_cast<size_t>(r) * SH + c] & 0xFFFFFFu, col = r / s.k;
+  src.cpu(true, false); i1.cpu(true, false);
+  for (uint32_t r = 0; r < SW * k; ++r) for (uint32_t c = 0; c < SH; ++c) {
+    const uint32_t got = i1.px[static_cast<size_t>(r) * SH + c] & 0xFFFFFFu, col = r / k;
     cw  += got != (src.px[static_cast<size_t>(SH - 1 - c) * SW + col] & 0xFFFFFFu);
     ccw += got != (src.px[static_cast<size_t>(c) * SW + (SW - 1 - col)] & 0xFFFFFFu);
   }
-  src.cpu(false, false); s.i1.cpu(false, false);
+  src.cpu(false, false); i1.cpu(false, false);
   std::printf("  pass A intermediate: %zu mismatches as clockwise, %zu as counter-clockwise (%s)\n", cw, ccw,
               !cw || !ccw ? "pass A is exact; look at pass B" : "neither rotation: the rotated 1:1 copy is not exact (see the kernel caveat above)");
 }
@@ -356,7 +450,7 @@ bool int_case(const char* dev, const char* name, const Buf& src, uint32_t pw, ui
   if (!s.run(src, panel, x0, y0)) { std::printf("  FAIL: job\n"); return false; }
   const size_t bad = check(src, panel, pw, ph, k, x0, y0);
   dump(std::getenv("DS_RGA_DUMP"), name, panel, pw, ph);
-  if (bad) { std::printf("  FAIL: %zu of %u pixels differ\n", bad, pw * ph); diagnose_pass_a(src, s); return false; }
+  if (bad) { std::printf("  FAIL: %zu of %u pixels differ\n", bad, pw * ph); s.diagnose(src); return false; }
   std::printf("  exact: every pixel matches nearest, letterbox untouched\n");
   std::vector<double> ms, pass[S::kPasses];
   for (int i = 0; i < iters; ++i) {
@@ -367,9 +461,7 @@ bool int_case(const char* dev, const char* name, const Buf& src, uint32_t pw, ui
     for (int j = 0; j < S::kPasses; ++j) pass[j].push_back(p[j]);
   }
   report("integer nearest", ms, s.jobs());
-  // The intermediates are each one 256k x 192 image; the last pass writes the k times taller view.
-  const double img = SW * k * SH * 4 / 1048576.0;
-  for (int j = 0; j < S::kPasses; ++j) report_pass(S::kPassNames[j], pass[j], j + 1 == S::kPasses ? img * k : img);
+  for (int j = 0; j < S::kPasses; ++j) report_pass(S::kPassNames[j], pass[j], s.pass_mib(j));
   return true;
 }
 
@@ -387,7 +479,7 @@ bool sharp_case(const char* dev, const Buf& src, uint32_t pw, uint32_t ph, uint3
   const int jobs = s.jobs();
   if (!s.run(src, i2, 0, 0)) { std::printf("  FAIL: job\n"); return false; }
   const size_t bad = check(src, i2, SW * k, SH * k, k, 0, 0);
-  if (bad) { std::printf("  FAIL: the integer stage has %zu bad pixels\n", bad); diagnose_pass_a(src, s); return false; }
+  if (bad) { std::printf("  FAIL: the integer stage has %zu bad pixels\n", bad); s.diagnose(src); return false; }
   if (!c.scale(i2, panel, fit)) { std::printf("  FAIL: scaling job\n"); return false; }
   std::printf("  integer stage exact; the final scale is the hardware's filter (inspect the dump)\n");
   dump(std::getenv("DS_RGA_DUMP"), "sharp", panel, pw, ph);
@@ -434,9 +526,25 @@ int main(int argc, char** argv) {
   if (!src.alloc(static_cast<size_t>(SW) * SH * 4)) return 1;
   fill_source(src);
 
+  // What the presenter's CPU does today per screen: the 1x frame into the RGA source.
+  {
+    Buf stage;
+    if (!stage.alloc(static_cast<size_t>(SW) * SH * 4)) return 1;
+    std::vector<double> ms;
+    for (int i = 0; i < iters; ++i) {
+      const double t0 = now_ms();
+      stage.cpu(true, true); std::memcpy(stage.px, src.px, static_cast<size_t>(SW) * SH * 4); stage.cpu(false, true);
+      ms.push_back(now_ms() - t0);
+    }
+    std::sort(ms.begin(), ms.end());
+    std::printf("baseline: today's 192 KB copy into the RGA source, median %.3f ms\n", ms.empty() ? 0.0 : ms[ms.size() / 2]);
+  }
+
   const int cx = static_cast<int>(pw - SW * k) / 2, cy = static_cast<int>(ph - SH * k) / 2;
   bool ok = int_case<IntScaler>(dev.c_str(), "centred", src, pw, ph, k, cx, cy, iters);
   ok &= int_case<IntScalerFlat>(dev.c_str(), "centred-flat", src, pw, ph, k, cx, cy, iters);
+  ok &= int_case<IntScalerCpuRows>(dev.c_str(), "centred-cpu-rows", src, pw, ph, k, cx, cy, iters);
+  if (k % 2 == 0) ok &= int_case<IntScalerCpu2Rot>(dev.c_str(), "centred-cpu2-rot", src, pw, ph, k, cx, cy, iters);
   // Odd offsets exercise the band carry in pass B (y0 not a multiple of k).
   if (k >= 2) {
     const uint32_t k2 = k - 1;
@@ -445,6 +553,7 @@ int main(int argc, char** argv) {
     {
       ok &= int_case<IntScaler>(dev.c_str(), "offset", src, pw, ph, k2, x0, y0, iters);
       ok &= int_case<IntScalerFlat>(dev.c_str(), "offset-flat", src, pw, ph, k2, x0, y0, iters);
+      ok &= int_case<IntScalerCpuRows>(dev.c_str(), "offset-cpu-rows", src, pw, ph, k2, x0, y0, iters);
     }
   }
   // Fractional fits (640x480 is 2.5x): the integer stage plus one scaling job.
