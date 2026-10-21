@@ -22,6 +22,10 @@
 // context ("sharp") optionally bilinear-scales the integer image to a
 // fractional size (e.g. 640x480 at 2.5x from 512x384).
 //
+// The "-flat" cases run IntScalerFlat: the same result with only the small
+// image rotated and the panel-sized writes unrotated, timed per pass, to
+// show whether rotated writes are what costs.
+//
 // Every integer case compares each panel pixel with centre-sampled nearest
 // (and the letterbox with its untouched fill). Device-only, not a test;
 // --sim runs the same jobs through a software model of the RGA, which
@@ -216,17 +220,63 @@ struct IntScaler {
     if (!i1.alloc(static_cast<size_t>(SH) * SW * k * 4)) return false;
     return a.open(dev, Fmt{SW, SH}, Fmt{SH * k, SW}, 90) && b.open(dev, Fmt{SH, SW * k}, Fmt{k * tw, th / k}, 270);
   }
-  bool run(const Buf& src, const Buf& target, int x0, int y0, int* jobs) {
+  static constexpr int kPasses = 2;
+  static constexpr const char* kPassNames[kPasses] = {"A rot90, k jobs (192 x 256k)", "B rot270, k jobs (panel)"};
+  int jobs() const { return static_cast<int>(2 * k); }
+  // pass_ms, if given: the time of each pass.
+  bool run(const Buf& src, const Buf& target, int x0, int y0, double* pass_ms = nullptr) {
+    double t0 = now_ms();
     // Pass A: band j of the virtual 192k x 256 image is physical rows k*r + j.
     for (uint32_t j = 0; j < k; ++j)
       if (!a.blit(src, i1, Rect{static_cast<int>(SH * j), 0, static_cast<int>(SH), static_cast<int>(SW)})) return false;
+    if (pass_ms) { const double t1 = now_ms(); pass_ms[0] = t1 - t0; t0 = t1; }
     // Pass B: physical row y0 + k*s + j is virtual row (y0 + j)/k + s, band (y0 + j) % k.
     for (uint32_t j = 0; j < k; ++j) {
       const uint32_t t = static_cast<uint32_t>(y0) + j;
       const Rect r{static_cast<int>((t % k) * tw) + x0, static_cast<int>(t / k), static_cast<int>(SW * k), static_cast<int>(SH)};
       if (!b.blit(i1, target, r)) return false;
     }
-    if (jobs) *jobs = static_cast<int>(2 * k);
+    if (pass_ms) pass_ms[1] = now_ms() - t0;
+    return true;
+  }
+};
+
+// The same result with the panel-sized writes unrotated: rotation only
+// touches the column-repeated 256k x 192 image (twice), and the row repeat
+// into the panel is a plain 1:1 copy. Worth it if rotated writes are the
+// slow part. Its last pass reads a 256k-wide source (1024 px at 4x).
+//
+//   pass A (rotate 90):  src -> I1 (192 x 256k, columns repeated), k jobs
+//   pass B (rotate 270): I1 -> I2 (256k x 192), one job
+//   pass C (no rotation): I2 -> target described as k*W x H/k, k jobs
+struct IntScalerFlat {
+  uint32_t k = 1, tw = 0, th = 0;
+  Rga a, b, c;
+  Buf i1, i2;
+  bool open(const char* dev, uint32_t k_, uint32_t tw_, uint32_t th_) {
+    k = k_; tw = tw_; th = th_;
+    if (k * tw > 8192 || SW * k > 8192 || th / k < 34) { std::printf("k=%u on %ux%u exceeds the driver's 8192 / 34 limits\n", k, tw, th); return false; }
+    const size_t bytes = static_cast<size_t>(SH) * SW * k * 4;
+    if (!i1.alloc(bytes) || !i2.alloc(bytes)) return false;
+    return a.open(dev, Fmt{SW, SH}, Fmt{SH * k, SW}, 90) && b.open(dev, Fmt{SH, SW * k}, Fmt{SW * k, SH}, 270) &&
+           c.open(dev, Fmt{SW * k, SH}, Fmt{k * tw, th / k}, 0);
+  }
+  static constexpr int kPasses = 3;
+  static constexpr const char* kPassNames[kPasses] = {"A rot90, k jobs (192 x 256k)", "B rot270, 1 job (256k x 192)", "C unrotated, k jobs (panel)"};
+  int jobs() const { return static_cast<int>(2 * k + 1); }
+  bool run(const Buf& src, const Buf& target, int x0, int y0, double* pass_ms = nullptr) {
+    double t0 = now_ms();
+    for (uint32_t j = 0; j < k; ++j)
+      if (!a.blit(src, i1, Rect{static_cast<int>(SH * j), 0, static_cast<int>(SH), static_cast<int>(SW)})) return false;
+    if (pass_ms) { const double t1 = now_ms(); pass_ms[0] = t1 - t0; t0 = t1; }
+    if (!b.blit(i1, i2, Rect{0, 0, static_cast<int>(SW * k), static_cast<int>(SH)})) return false;
+    if (pass_ms) { const double t1 = now_ms(); pass_ms[1] = t1 - t0; t0 = t1; }
+    for (uint32_t j = 0; j < k; ++j) {
+      const uint32_t t = static_cast<uint32_t>(y0) + j;
+      const Rect r{static_cast<int>((t % k) * tw) + x0, static_cast<int>(t / k), static_cast<int>(SW * k), static_cast<int>(SH)};
+      if (!c.blit(i2, target, r)) return false;
+    }
+    if (pass_ms) pass_ms[2] = now_ms() - t0;
     return true;
   }
 };
@@ -255,7 +305,8 @@ size_t check(const Buf& src, const Buf& t, uint32_t tw, uint32_t th, uint32_t k,
 }
 
 // After a failure: is I1 an exact rotated, row-repeated copy, and which way?
-void diagnose_pass_a(const Buf& src, const IntScaler& s) {
+template <class S>
+void diagnose_pass_a(const Buf& src, const S& s) {
   size_t cw = 0, ccw = 0;
   src.cpu(true, false); s.i1.cpu(true, false);
   for (uint32_t r = 0; r < SW * s.k; ++r) for (uint32_t c = 0; c < SH; ++c) {
@@ -286,23 +337,39 @@ void report(const char* what, std::vector<double>& ms, int jobs) {
   std::sort(ms.begin(), ms.end());
   std::printf("  %s: median %.3f ms, p90 %.3f, max %.3f (%d jobs per view, %zu runs)\n", what, ms[ms.size() / 2], ms[ms.size() * 9 / 10], ms.back(), jobs, ms.size());
 }
+// One pass's median, and the rate of its writes.
+void report_pass(const char* what, std::vector<double>& ms, double mib) {
+  if (ms.empty()) return;
+  std::sort(ms.begin(), ms.end());
+  const double med = ms[ms.size() / 2];
+  std::printf("    %-32s median %.3f ms, writes %.2f MiB (%.0f MiB/s)\n", what, med, mib, med > 0 ? mib * 1000.0 / med : 0.0);
+}
 
-// One integer case into a panel-sized target: correctness, then timing.
+// One integer case into a panel-sized target: correctness, then timing (in total and per pass).
+template <class S>
 bool int_case(const char* dev, const char* name, const Buf& src, uint32_t pw, uint32_t ph, uint32_t k, int x0, int y0, int iters) {
   std::printf("%s: %ux at %d,%d (%ux%u) on %ux%u\n", name, k, x0, y0, SW * k, SH * k, pw, ph);
-  IntScaler s;
+  S s;
   Buf panel;
   if (!panel.alloc(static_cast<size_t>(pw) * ph * 4) || !s.open(dev, k, pw, ph)) { std::printf("  FAIL: setup\n"); return false; }
   fill(panel, static_cast<size_t>(pw) * ph, kFill);
-  int jobs = 0;
-  if (!s.run(src, panel, x0, y0, &jobs)) { std::printf("  FAIL: job\n"); return false; }
+  if (!s.run(src, panel, x0, y0)) { std::printf("  FAIL: job\n"); return false; }
   const size_t bad = check(src, panel, pw, ph, k, x0, y0);
   dump(std::getenv("DS_RGA_DUMP"), name, panel, pw, ph);
   if (bad) { std::printf("  FAIL: %zu of %u pixels differ\n", bad, pw * ph); diagnose_pass_a(src, s); return false; }
   std::printf("  exact: every pixel matches nearest, letterbox untouched\n");
-  std::vector<double> ms;
-  for (int i = 0; i < iters; ++i) { const double t0 = now_ms(); if (!s.run(src, panel, x0, y0, nullptr)) return false; ms.push_back(now_ms() - t0); }
-  report("integer nearest", ms, jobs);
+  std::vector<double> ms, pass[S::kPasses];
+  for (int i = 0; i < iters; ++i) {
+    double p[S::kPasses];
+    const double t0 = now_ms();
+    if (!s.run(src, panel, x0, y0, p)) return false;
+    ms.push_back(now_ms() - t0);
+    for (int j = 0; j < S::kPasses; ++j) pass[j].push_back(p[j]);
+  }
+  report("integer nearest", ms, s.jobs());
+  // The intermediates are each one 256k x 192 image; the last pass writes the k times taller view.
+  const double img = SW * k * SH * 4 / 1048576.0;
+  for (int j = 0; j < S::kPasses; ++j) report_pass(S::kPassNames[j], pass[j], j + 1 == S::kPasses ? img * k : img);
   return true;
 }
 
@@ -317,8 +384,8 @@ bool sharp_case(const char* dev, const Buf& src, uint32_t pw, uint32_t ph, uint3
   if (!i2.alloc(static_cast<size_t>(SW) * k * SH * k * 4) || !panel.alloc(static_cast<size_t>(pw) * ph * 4) ||
       !s.open(dev, k, SW * k, SH * k) || !c.open(dev, Fmt{SW * k, SH * k}, Fmt{pw, ph}, 0)) { std::printf("  FAIL: setup\n"); return false; }
   fill(panel, static_cast<size_t>(pw) * ph, kFill);
-  int jobs = 0;
-  if (!s.run(src, i2, 0, 0, &jobs)) { std::printf("  FAIL: job\n"); return false; }
+  const int jobs = s.jobs();
+  if (!s.run(src, i2, 0, 0)) { std::printf("  FAIL: job\n"); return false; }
   const size_t bad = check(src, i2, SW * k, SH * k, k, 0, 0);
   if (bad) { std::printf("  FAIL: the integer stage has %zu bad pixels\n", bad); diagnose_pass_a(src, s); return false; }
   if (!c.scale(i2, panel, fit)) { std::printf("  FAIL: scaling job\n"); return false; }
@@ -327,7 +394,7 @@ bool sharp_case(const char* dev, const Buf& src, uint32_t pw, uint32_t ph, uint3
   std::vector<double> ms;
   for (int i = 0; i < iters; ++i) {
     const double t0 = now_ms();
-    if (!s.run(src, i2, 0, 0, nullptr) || !c.scale(i2, panel, fit)) return false;
+    if (!s.run(src, i2, 0, 0) || !c.scale(i2, panel, fit)) return false;
     ms.push_back(now_ms() - t0);
   }
   report("sharp bilinear", ms, jobs + 1);
@@ -367,13 +434,18 @@ int main(int argc, char** argv) {
   if (!src.alloc(static_cast<size_t>(SW) * SH * 4)) return 1;
   fill_source(src);
 
-  bool ok = int_case(dev.c_str(), "centred", src, pw, ph, k, static_cast<int>(pw - SW * k) / 2, static_cast<int>(ph - SH * k) / 2, iters);
+  const int cx = static_cast<int>(pw - SW * k) / 2, cy = static_cast<int>(ph - SH * k) / 2;
+  bool ok = int_case<IntScaler>(dev.c_str(), "centred", src, pw, ph, k, cx, cy, iters);
+  ok &= int_case<IntScalerFlat>(dev.c_str(), "centred-flat", src, pw, ph, k, cx, cy, iters);
   // Odd offsets exercise the band carry in pass B (y0 not a multiple of k).
   if (k >= 2) {
     const uint32_t k2 = k - 1;
     const int x0 = static_cast<int>((pw - SW * k2) / 2) | 1, y0 = static_cast<int>((ph - SH * k2) / 2) | 1;
     if (static_cast<uint32_t>(x0) + SW * k2 <= pw && static_cast<uint32_t>(y0) + SH * k2 <= ph)
-      ok &= int_case(dev.c_str(), "offset", src, pw, ph, k2, x0, y0, iters);
+    {
+      ok &= int_case<IntScaler>(dev.c_str(), "offset", src, pw, ph, k2, x0, y0, iters);
+      ok &= int_case<IntScalerFlat>(dev.c_str(), "offset-flat", src, pw, ph, k2, x0, y0, iters);
+    }
   }
   // Fractional fits (640x480 is 2.5x): the integer stage plus one scaling job.
   const uint32_t fw = std::min(pw, ph * SW / SH);
