@@ -799,11 +799,11 @@ struct VideoSetup {
   u32    chunky_thresh = 180 * 256;
   ds::sdl::Display::Layout layout;
   std::vector<ds::sdl::Display::Mode> layout_cycle;
+  bool   gpu_present = false;
+  ds::sdl::Display::GpuPresentMode gpu_mode = ds::sdl::Display::GpuPresentMode::Auto;   // video.gpu_present: true (auto: RGA, else Vulkan) | rga | vulkan
   // Boot-only, see above.
   ds::frontend::Sink panel_sink = ds::frontend::Sink::Count;   // Disp/Fbdev when one owns the panel (frontend/video/select.h)
   ds::frontend::Sink want_sink = ds::frontend::Sink::Count;    // explicit video.sink among the window sinks
-  bool   gpu_present = false;
-  ds::sdl::Display::GpuPresentMode gpu_mode = ds::sdl::Display::GpuPresentMode::Auto;   // video.gpu_present: true (auto: RGA, else Vulkan) | rga | vulkan
   int    upper_display = 0, lower_display = 1;   // dual-window: SDL display per physical panel
 };
 
@@ -838,6 +838,14 @@ bool parse_video(const ds::sdl::Config& cfg, VideoSetup& vs) {
   if (vs.scale < 1) vs.scale = 1;
   vs.fullscreen = cfg.flag("video.fullscreen", false);
   vs.linear = cfg.flag("video.linear", false);
+  // GPU present stage, default on. Display falls back to the scanline scaler
+  // without dma-buf import, and GpuPresent::open() declines without Vulkan.
+  // Read here, not at boot only, so reopening for a menu change keeps it.
+  {
+    const std::string g = cfg.str("video.gpu_present", "true");
+    vs.gpu_mode = g == "rga" ? Disp::GpuPresentMode::Rga : g == "vulkan" ? Disp::GpuPresentMode::Vulkan : Disp::GpuPresentMode::Auto;
+    vs.gpu_present = g == "rga" || g == "vulkan" || g == "true" || g == "auto" || g == "on" || g == "1";
+  }
   vs.vsync = cfg.flag("video.vsync", true);
   vs.dual_window = cfg.flag("video.dual_window", false);
   if (!Disp::parse_int_scale(cfg.str("video.integer_scale", "off"), vs.int_scale)) { std::fprintf(stderr, "integer_scale must be off, under or over\n"); return false; }
@@ -1458,14 +1466,6 @@ static int run(int argc, char** argv) {
   if (vs.panel_sink == ds::frontend::Sink::Disp && chunky != 0 && chunky != 2) {
     std::fprintf(stderr, "chunky %s: the display-engine tier draws chunky cells in the scaler as their mean; using mean\n", cfg.str("video.chunky").c_str());
     chunky = 2;
-  }
-
-  // GPU present stage, default on. Display falls back to the scanline scaler
-  // without dma-buf import, and GpuPresent::open() declines without Vulkan.
-  {
-    const std::string g = cfg.str("video.gpu_present", "true");
-    vs.gpu_mode = g == "rga" ? ds::sdl::Display::GpuPresentMode::Rga : g == "vulkan" ? ds::sdl::Display::GpuPresentMode::Vulkan : ds::sdl::Display::GpuPresentMode::Auto;
-    vs.gpu_present = g == "rga" || g == "vulkan" || g == "true" || g == "auto" || g == "on" || g == "1";
   }
 
   u32 init = SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER;
