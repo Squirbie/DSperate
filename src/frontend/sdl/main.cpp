@@ -1249,9 +1249,16 @@ static int run(int argc, char** argv) {
     std::fprintf(stderr, "net: --internet is not local wireless; pick one\n");
     return 1;
   }
+  // A bad dump fails the run once the panel is open, to say so there (the
+  // substitutes stand in until then).
+  std::string bios_error;
   {
     std::string err;
-    if (!nds.load_bios(bios9, bios7, fw, user, &err)) { std::fprintf(stderr, "bios: %s\n", err.c_str()); return 1; }
+    if (!nds.load_bios(bios9, bios7, fw, user, &err)) {
+      std::fprintf(stderr, "bios: %s\n", err.c_str());
+      bios_error = err;
+      nds.load_bios("", "", "", user);
+    }
     if (!nds.firmware_synthetic) VLOG("firmware: %s\n", fw.c_str());
     // A fixed MAC (dump's own, or generated 00:09:BF:11:22:33) collides
     // across instances and breaks PictoChat. Low 3 bytes generated once,
@@ -1602,6 +1609,54 @@ sdl_ready:
       nds.gpu.set_scale_target(i, st);
     }
   };
+  // Leaving before the frame loop, once the panels are open: torn down in the
+  // same order as at the end (SDL_Quit with a GL context still up can assert).
+  auto quit_early = [&](int code) {
+    input.close();
+    audio.close();
+    display.close();
+    display2.close();
+    SDL_Quit();
+    return code;
+  };
+  // One frame of a centred notice over the game's screens, dimmed (black
+  // before a game has drawn anything).
+  auto draw_notice_frame = [&](const std::string& title, const char* line2, const char* line3) {
+    const int menu_screen = dual_window ? 0 : display.current_layout().primary;
+    const u32* fb[2];
+    for (int i = 0; i < 2; ++i) {
+      std::memcpy(menu_fb[i].data(), nds.gpu.framebuffer(i), menu_fb[i].size() * 4);
+      ds::sdl::dim_framebuffer(menu_fb[i].data(), static_cast<u32>(menu_fb[i].size()));
+      fb[i] = menu_fb[i].data();
+    }
+    // Drawn on the panel's own pixels where writable, at panel resolution.
+    const bool on_canvas = display.canvas_capable();
+    if (!on_canvas) ds::sdl::draw_notice(ds_canvas(menu_fb[menu_screen].data()), title.c_str(), line2, line3);
+    ds::sdl::Display::Target target[2] = {};
+    if (dual_window) sync_dual_modes(display, display2);
+    bool scaled = display.begin_frame(target);
+    if (dual_window) scaled = display2.begin_frame(target) && scaled;
+    if (scaled) {
+      set_scale_targets(target, true, true);
+      for (int i = 0; i < 2; ++i) nds.gpu.scale_image(i, menu_fb[i].data());
+      // Before the notice: a PiP inset must not land on top of it.
+      display.finish_views();
+      if (dual_window) display2.finish_views();
+      ds::sdl::Display::CanvasView cv;
+      if (on_canvas && display.canvas(cv)) {
+        ds::sdl::draw_notice(ds::sdl::Canvas{cv.px, cv.pitch, cv.w, cv.h}, title.c_str(), line2, line3);
+        // Whole canvas: nothing else redraws the letterbox around it.
+        display.note_canvas_draw_all();
+      }
+      display.present();
+      if (dual_window) display2.present();
+      set_scale_targets(target, false);
+    } else {
+      display.draw(fb);
+      if (dual_window) display2.draw(fb);
+    }
+  };
+  bool rom_cancelled = false;   // the last load_rom_notice was stopped with B
   // Loads a ROM with an "unpacking" notice if it takes more than a moment.
   // Load runs on a worker; this thread pumps events (B/quit cancels) and
   // redraws the notice. Dots advance only on extraction progress.
@@ -1632,51 +1687,49 @@ sdl_ready:
       if (!shown && now - start < 300) { SDL_Delay(10); continue; }   // a loose or cached game never shows it
       if (!shown) display.set_page(true);
       shown = true;
-      const int menu_screen = dual_window ? 0 : display.current_layout().primary;
-      const u32* fb[2];
-      for (int i = 0; i < 2; ++i) {
-        std::memcpy(menu_fb[i].data(), nds.gpu.framebuffer(i), menu_fb[i].size() * 4);
-        ds::sdl::dim_framebuffer(menu_fb[i].data(), static_cast<u32>(menu_fb[i].size()));
-        fb[i] = menu_fb[i].data();
-      }
       char line2[32];
       if (cancel) std::snprintf(line2, sizeof line2, "STOPPING");
       else if (now - last_change > 5000) std::snprintf(line2, sizeof line2, "WAITING ON THE CARD");
       else std::snprintf(line2, sizeof line2, "UNPACKING%.*s", dots, "...");
-      const char* const line3 = "FIRST LAUNCH ONLY    B CANCELS";
-      // Drawn on the panel's own pixels where writable, at panel resolution.
-      const bool on_canvas = display.canvas_capable();
-      if (!on_canvas) ds::sdl::draw_notice(ds_canvas(menu_fb[menu_screen].data()), title.c_str(), line2, line3);
-      ds::sdl::Display::Target target[2] = {};
-      if (dual_window) sync_dual_modes(display, display2);
-      bool scaled = display.begin_frame(target);
-      if (dual_window) scaled = display2.begin_frame(target) && scaled;
-      if (scaled) {
-        set_scale_targets(target, true, true);
-        for (int i = 0; i < 2; ++i) nds.gpu.scale_image(i, menu_fb[i].data());
-        // Before the notice: a PiP inset must not land on top of it.
-        display.finish_views();
-        if (dual_window) display2.finish_views();
-        ds::sdl::Display::CanvasView cv;
-        if (on_canvas && display.canvas(cv)) {
-          ds::sdl::draw_notice(ds::sdl::Canvas{cv.px, cv.pitch, cv.w, cv.h}, title.c_str(), line2, line3);
-          // Whole canvas: nothing else redraws the letterbox around it.
-          display.note_canvas_draw_all();
-        }
-        display.present();
-        if (dual_window) display2.present();
-        set_scale_targets(target, false);
-      } else {
-        display.draw(fb);
-        if (dual_window) display2.draw(fb);
-      }
+      draw_notice_frame(title, line2, "FIRST LAUNCH ONLY    B CANCELS");
       SDL_Delay(50);
     }
     worker.join();
     if (shown) display.set_page(false);
     nds.rom_cancel = nullptr; nds.rom_progress = nullptr; nds.rom_progress_user = nullptr;
-    if (!ok && cancel) VLOG("unpacking cancelled\n");
+    rom_cancelled = !ok && cancel;
+    if (rom_cancelled) VLOG("unpacking cancelled\n");
     return ok;
+  };
+  // A game that cannot start says why on the panel, not only in the log, and
+  // waits for a button (or a minute) before the caller exits: started from a
+  // launcher, the player is back in it knowing what went wrong. `why` is the
+  // panel's short line (19 characters fit); the log has the details.
+  auto start_failed = [&](const std::string& path, const char* why) {
+    std::fprintf(stderr, "launch: %s cannot start: %s\n", path.c_str(), why);
+    if (g_signalled || input.quit()) return;
+    const std::string title = rom_stem(base_name(path));
+    display.set_page(true);
+    const Uint32 start = SDL_GetTicks();
+    while (!g_signalled && !input.quit() && SDL_GetTicks() - start < 60000) {
+      SDL_Event e;
+      while (SDL_PollEvent(&e)) input.handle(e, display, dual_window ? &display2 : nullptr);
+      // Presses in the first half second are the one that launched the game.
+      if (input.take_menu_presses() && SDL_GetTicks() - start > 500) break;
+      draw_notice_frame(title, why, "ANY BUTTON RETURNS");
+      SDL_Delay(50);
+    }
+    display.set_page(false);
+  };
+  // The panel's line for a ROM that would not load, from what the loader said.
+  auto rom_failure = [](const std::string& path, const std::string& err) -> const char* {
+    if (FILE* f = std::fopen(path.c_str(), "rb")) std::fclose(f);
+    else return "FILE CANNOT BE READ";
+    if (err.find("corrupt zip") != std::string::npos || err.find("not a zip") != std::string::npos) return "THE ZIP IS DAMAGED";
+    if (err.find("no .nds") != std::string::npos) return "NO GAME IN THE ZIP";
+    if (err.find("in the archive") != std::string::npos || err.find("the archive is") != std::string::npos ||
+        err.find("compression method") != std::string::npos) return "ZIP NOT SUPPORTED";
+    return "NOT A DS GAME";
   };
   auto discard_session_cache = [&] {
     if (cache_session && !nds.rom_cache_path.empty()) { ds::cart::remove_cached(nds.rom_cache_path); nds.rom_cache_path.clear(); }
@@ -1691,13 +1744,21 @@ sdl_ready:
     if (!nds.load_dsi_nand_title(sc.title_lo, &err)) { std::fprintf(stderr, "dsi: %s: %s\n", path.c_str(), err.c_str()); return false; }
     return true;
   };
+  if (!bios_error.empty()) {
+    start_failed(rom_path, bios_error.find("firmware") != std::string::npos ? "FIRMWARE IS BAD" : "DS BIOS IS BAD");
+    return quit_early(1);
+  }
   if (dsi_hle && rom_shortcut) {
-    if (!load_shortcut_title(rom_path)) { SDL_Quit(); return 1; }
+    if (!load_shortcut_title(rom_path)) { return quit_early(1); }
   } else if (dsi_hle && rom_is_cia) {
     std::vector<ds::u8> srl;
     std::string err;
-    if (!ds::io::read_dsiware(rom_path, srl, &err) || !nds.load_rom_image(std::move(srl))) { std::fprintf(stderr, "dsi: %s: %s\n", rom_path.c_str(), err.c_str()); SDL_Quit(); return 1; }
-  } else if (!boot_firmware && !load_rom_notice(rom_path)) { std::fprintf(stderr, "could not read %s\n", rom_path.c_str()); SDL_Quit(); return 1; }
+    if (!ds::io::read_dsiware(rom_path, srl, &err) || !nds.load_rom_image(std::move(srl))) { std::fprintf(stderr, "dsi: %s: %s\n", rom_path.c_str(), err.c_str()); return quit_early(1); }
+  } else if (!boot_firmware && !load_rom_notice(rom_path)) {
+    std::fprintf(stderr, "could not read %s\n", rom_path.c_str());
+    if (!rom_cancelled) start_failed(rom_path, rom_failure(rom_path, nds.rom_error));
+    return quit_early(1);
+  }
   auto prepare_dsiware = [&]() -> bool {
     std::string err;
     std::vector<std::string> made;
@@ -1710,7 +1771,7 @@ sdl_ready:
     for (const std::string& m : made) std::fprintf(stderr, "dsi: %s\n", m.c_str());
     return true;
   };
-  if (dsi_hle && !prepare_dsiware()) { SDL_Quit(); return 1; }
+  if (dsi_hle && !prepare_dsiware()) { return quit_early(1); }
   // Firmware boot: BootMenu.nds beside the config wins if present, else a
   // built-in loader cart is assembled in memory. Not while autoloading DSiWare.
   if (boot_firmware && (!dsi_mode || (!dsi_hle && (!dsi_title || dsi_menu)))) {
@@ -1743,7 +1804,7 @@ sdl_ready:
   else VLOG("rtc: frozen for the replay\n");
   if (replay && rtc_host) std::fprintf(stderr, "rtc: --rtc-host over a replay; this run is not reproducible\n");
 #if DSPERATE_JIT
-  if (jit && !ds::jit::attach(nds, true, true)) return 1;
+  if (jit && !ds::jit::attach(nds, true, true)) return quit_early(1);
   // The DS menu boots under per-instruction budget checks: block-granularity
   // overshoot can intermittently stop it booting. Dropped once a game
   // launches; not the DSi Menu, which runs fine without it.
@@ -1757,10 +1818,10 @@ sdl_ready:
   if (save_readonly) VLOG("save: read-only for the replay\n");
 
   ds::input::Log log;
-  if (record && replay) { std::fprintf(stderr, "--record and --replay are exclusive\n"); return 2; }
-  if (record && !log.open_write(record)) { std::fprintf(stderr, "cannot write %s\n", record); return 1; }
+  if (record && replay) { std::fprintf(stderr, "--record and --replay are exclusive\n"); return quit_early(2); }
+  if (record && !log.open_write(record)) { std::fprintf(stderr, "cannot write %s\n", record); return quit_early(1); }
   if (replay) {
-    if (!log.open_read(replay)) { std::fprintf(stderr, "cannot read %s\n", replay); return 1; }
+    if (!log.open_read(replay)) { std::fprintf(stderr, "cannot read %s\n", replay); return quit_early(1); }
     VLOG("replay: %u frames from %s\n", log.frames(), replay);
   }
   // After the battery save (state's SRAM wins) and after the replay log
@@ -1774,7 +1835,7 @@ sdl_ready:
     bool got_layout = false;
     // Unreadable --load-state fails the run; an unreadable auto state just boots normally.
     if (!load_state_file(nds, start_state, layout, got_layout)) {
-      if (load_state) return 1;
+      if (load_state) { start_failed(rom_path, "STATE NOT LOADED"); return quit_early(1); }
     } else {
       if (!load_state) std::fprintf(stderr, "state: autoloaded %s\n", start_state);
       // The state's view replaces the config's, dual-window aside.
