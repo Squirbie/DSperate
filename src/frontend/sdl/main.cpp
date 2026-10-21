@@ -167,8 +167,8 @@ const char* kUsage =
     "                  surface (SDL's window surface) | renderer (SDL_Renderer). One that won't open\n"
     "                  falls back to the renderer. video.sink. --disp / --fbdev are --sink disp / fbdev\n"
     "  --gpu-present / --no-gpu-present  scale and lay out the picture off the CPU, into the\n"
-    "                  scanout buffer: the Rockchip RGA where the device has one, else a Vulkan\n"
-    "                  compute pass (video.gpu_present = true | rga | vulkan | false; on by default)\n"
+    "                  scanout buffer: a Vulkan render pass, else the Rockchip RGA where the\n"
+    "                  device has one (video.gpu_present = true | rga | vulkan | false; on by default)\n"
     "  --preload-rom / --no-preload-rom  read the whole ROM into memory at load, or page it in as\n"
     "                  the game reads it (cart.preload = auto | true | false; auto preloads a ROM on a\n"
     "                  network share that fits in memory, where a page read mid-frame is a round trip)\n"
@@ -799,11 +799,11 @@ struct VideoSetup {
   u32    chunky_thresh = 180 * 256;
   ds::sdl::Display::Layout layout;
   std::vector<ds::sdl::Display::Mode> layout_cycle;
+  bool   gpu_present = false;
+  ds::sdl::Display::GpuPresentMode gpu_mode = ds::sdl::Display::GpuPresentMode::Auto;   // video.gpu_present: true (auto: Vulkan, else RGA) | rga | vulkan
   // Boot-only, see above.
   ds::frontend::Sink panel_sink = ds::frontend::Sink::Count;   // Disp/Fbdev when one owns the panel (frontend/video/select.h)
   ds::frontend::Sink want_sink = ds::frontend::Sink::Count;    // explicit video.sink among the window sinks
-  bool   gpu_present = false;
-  ds::sdl::Display::GpuPresentMode gpu_mode = ds::sdl::Display::GpuPresentMode::Auto;   // video.gpu_present: true (auto: RGA, else Vulkan) | rga | vulkan
   int    upper_display = 0, lower_display = 1;   // dual-window: SDL display per physical panel
 };
 
@@ -838,6 +838,14 @@ bool parse_video(const ds::sdl::Config& cfg, VideoSetup& vs) {
   if (vs.scale < 1) vs.scale = 1;
   vs.fullscreen = cfg.flag("video.fullscreen", false);
   vs.linear = cfg.flag("video.linear", false);
+  // GPU present stage, default on. Display falls back to the scanline scaler
+  // without dma-buf import, and GpuPresent::open() declines without Vulkan.
+  // Read here, not at boot only, so reopening for a menu change keeps it.
+  {
+    const std::string g = cfg.str("video.gpu_present", "true");
+    vs.gpu_mode = g == "rga" ? Disp::GpuPresentMode::Rga : g == "vulkan" ? Disp::GpuPresentMode::Vulkan : Disp::GpuPresentMode::Auto;
+    vs.gpu_present = g == "rga" || g == "vulkan" || g == "true" || g == "auto" || g == "on" || g == "1";
+  }
   vs.vsync = cfg.flag("video.vsync", true);
   vs.dual_window = cfg.flag("video.dual_window", false);
   if (!Disp::parse_int_scale(cfg.str("video.integer_scale", "off"), vs.int_scale)) { std::fprintf(stderr, "integer_scale must be off, under or over\n"); return false; }
@@ -1458,14 +1466,6 @@ static int run(int argc, char** argv) {
   if (vs.panel_sink == ds::frontend::Sink::Disp && chunky != 0 && chunky != 2) {
     std::fprintf(stderr, "chunky %s: the display-engine tier draws chunky cells in the scaler as their mean; using mean\n", cfg.str("video.chunky").c_str());
     chunky = 2;
-  }
-
-  // GPU present stage, default on. Display falls back to the scanline scaler
-  // without dma-buf import, and GpuPresent::open() declines without Vulkan.
-  {
-    const std::string g = cfg.str("video.gpu_present", "true");
-    vs.gpu_mode = g == "rga" ? ds::sdl::Display::GpuPresentMode::Rga : g == "vulkan" ? ds::sdl::Display::GpuPresentMode::Vulkan : ds::sdl::Display::GpuPresentMode::Auto;
-    vs.gpu_present = g == "rga" || g == "vulkan" || g == "true" || g == "auto" || g == "on" || g == "1";
   }
 
   u32 init = SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER;
@@ -2475,7 +2475,7 @@ sdl_ready:
         if (net_live && *net_live) return "NOT DURING A NETWORK SESSION";
         return cfg.num("emu.frameskip", 0) > 0 ? "" : "ONLY WITH FRAMESKIP ON";
       case ds::sdl::Dep::PanelEffects:
-        if (display.rga_present()) return "THE RGA ALWAYS SCALES BILINEAR";
+        if (display.rga_present()) return "";   // off: exact at whole-number scales, bilinear between
         return panel_effects() ? "" : "THIS SCREEN SCALES IN HARDWARE";
       case ds::sdl::Dep::GridSeam:
         if (display.rga_present()) return std::strcmp(s.key, "video.seam") == 0 ? "THE RGA DRAWS THE DARK GRID ONLY" : "";
