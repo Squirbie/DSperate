@@ -27,7 +27,9 @@ void main() {
   uint vi = k == 0u ? 0u : tri + k;
   GpuVert vt = verts[p.first_vert + vi];
   float w = max(float(vt.w), 1.0);
-  float sxf = float(vt.fx) / 16.0, syf = float(vt.fy) / 16.0;
+  // The DS floors its positions and lights the pixel a vertex lands in; a
+  // quarter-pixel pull back towards that measured closest to its edges.
+  float sxf = float(vt.fx) / 16.0 - 0.25, syf = float(vt.fy) / 16.0 - 0.25;
   float ox = 0.0, oy = 0.0;
   // A zero-width/height polygon is a line to the DS but zero area here:
   // give it one pixel via the second/third vertex.
