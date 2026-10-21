@@ -45,6 +45,7 @@
 #include "cpu_gov.h"
 #include "pacer.h"
 #include "present_thread.h"
+#include "rt_budget.h"
 
 #include <dirent.h>
 #include <algorithm>
@@ -67,6 +68,7 @@
 #include <cstring>
 #include <fstream>
 #include <functional>
+#include <optional>
 #include <thread>
 #include <atomic>
 #include <ctime>
@@ -300,6 +302,7 @@ bool aa_on(const std::string& v) {
 void apply_aa(NDS& nds, bool on) { nds.gpu3d.renderer().set_aa(on); }
 
 void load_save(NDS& nds, const std::string& path) {
+  const ds::sdl::OffRealtime off_rt;
   if (!nds.cart) return;
   FILE* f = std::fopen(path.c_str(), "rb");
   if (!f) {
@@ -488,6 +491,7 @@ void read_cheevos_chunk(ds::state::Reader& r) {
 
 
 bool save_state_file(NDS& nds, const std::string& path, const ds::sdl::Display::Layout& layout) {
+  const ds::sdl::OffRealtime off_rt;
   ds::state::Writer w; std::string err;
   if (!nds.save_state(w, err)) { std::fprintf(stderr, "state: cannot save: %s\n", err.c_str()); return false; }
   write_layout_chunk(w, layout);
@@ -509,6 +513,7 @@ std::string g_state_refused;
 // False if unusable, machine untouched; caller must reset if this fails
 // after the load began. `layout` is set only if the state carries one.
 bool load_state_file(NDS& nds, const std::string& path, ds::sdl::Display::Layout& layout, bool& layout_loaded) {
+  const ds::sdl::OffRealtime off_rt;
   layout_loaded = false;
   std::vector<u8> bytes;
   if (FILE* f = std::fopen(path.c_str(), "rb")) {
@@ -1661,6 +1666,7 @@ sdl_ready:
   // Load runs on a worker; this thread pumps events (B/quit cancels) and
   // redraws the notice. Dots advance only on extraction progress.
   auto load_rom_notice = [&](const std::string& path) -> bool {
+    const ds::sdl::OffRealtime off_rt;   // the worker inherits it
     std::atomic<bool> cancel{false}, done{false};
     std::atomic<u64> progress{0};
     bool ok = false;
@@ -1744,6 +1750,9 @@ sdl_ready:
     if (!nds.load_dsi_nand_title(sc.title_lo, &err)) { std::fprintf(stderr, "dsi: %s: %s\n", path.c_str(), err.c_str()); return false; }
     return true;
   };
+  // From the ROM to the starting state: one-shot work, off the real-time
+  // class (rt_budget.h). Inflating a big zipped ROM alone can outlast RLIMIT_RTTIME.
+  std::optional<ds::sdl::OffRealtime> startup_off_rt(std::in_place);
   if (!bios_error.empty()) {
     start_failed(rom_path, bios_error.find("firmware") != std::string::npos ? "FIRMWARE IS BAD" : "DS BIOS IS BAD");
     return quit_early(1);
@@ -1843,6 +1852,7 @@ sdl_ready:
       if (log.reading()) { ds::input::Frame f; for (u64 k = 0; k < nds.frame_count && log.read(f); ++k) {} }
     }
   }
+  startup_off_rt.reset();
   ds::sdl::Lid lid;
   if (!replay) lid.open();
   std::vector<s16> mic, mic_raw, mic_queue;
@@ -1983,6 +1993,7 @@ sdl_ready:
   bool ff_toggle = cfg.flag("emu.fast_forward", false);
   int ff_speed = cfg.num("emu.ff_speed", 0), ff_skip = cfg.num("emu.ff_skip", 3);
   bool was_fast = false;
+  ds::sdl::RtBudget rt_budget;   // RLIMIT_RTTIME (rt_budget.h)
   int ff_since = 0;           // frames since the last present, for fast forward's ff_skip
   std::vector<u32> cursor_fb(ds::SCREEN_W * ds::SCREEN_H);   // bottom screen with the pen crosshair
   std::vector<u32> osd_fb(ds::SCREEN_W * ds::SCREEN_H);      // primary screen with the slot digit / FPS counter
@@ -3052,6 +3063,7 @@ sdl_ready:
   // does the same from a script).
   bool from_list = false;   // the game running was picked from the list: RESET goes back to the firmware
   auto launch_game = [&](const std::string& pick) {
+    const ds::sdl::OffRealtime off_rt;   // reset, ROM, save and state: one-shot work
     VLOG("launcher: %s\n", pick.c_str());
     // DSiWare runs with the launcher hand-off and a made-up NAND; no way
     // back to the DS menu, the session ends when the title does.
@@ -3505,6 +3517,7 @@ sdl_ready:
       if (!said) { said = true; std::fprintf(stderr, "fast forward: not during a network session\n"); }
       fast = false;
     }
+    rt_budget.set_unpaced(fast || limiter_off, verbose());
     if (fast != was_fast) {
       was_fast = fast;
       pacer.reset();
@@ -3951,6 +3964,7 @@ sdl_ready:
       }
     }
     ++frames;
+    rt_budget.nap();
     // DS_SHOT_AT=N: a screenshot after frame N, for offscreen/replay runs.
     if (static const long shot_at = [] { const char* v = std::getenv("DS_SHOT_AT"); return v ? std::atol(v) : -1L; }(); shot_at >= 0 && frames == static_cast<u64>(shot_at)) shot_pending = true;
     // DS_LAUNCH_AT=<frame>:<path>: start that game at that frame, as the picker would.
